@@ -3,7 +3,8 @@ import pandas as pd
 import time
 import io
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
+from openpyxl import load_workbook
 from openpyxl.styles import PatternFill, Font, Alignment
 
 # Import existing logic
@@ -62,14 +63,12 @@ with st.sidebar:
     st.header("Settings")
     
     # API Key Input
-    # Check if key is already in secrets (Environment Variable)
     if "GEMINI_API_KEY" in st.secrets:
         os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
         from google import genai
         data_processor.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
         st.success("API Key loaded from Secrets ✅")
     else:
-        # Fallback for manual input
         api_key = st.text_input("Gemini API Key", type="password")
         if api_key:
             os.environ["GEMINI_API_KEY"] = api_key
@@ -157,15 +156,15 @@ if st.button("Start Analysis 🚀"):
                 
                 df["Listed 'o' / Non Listed \"x\""] = "o"
 
-                # Rename Date Columns
-                yesterday = datetime.now() - pd.Timedelta(days=1)
+                # Rename Date Columns (Using Yesterday logic like main.py)
+                yesterday = datetime.now() - timedelta(days=1)
                 yesterday_str = yesterday.strftime("%b %d")
                 
-                final_stock_price_col = f"Stock Price (Prev. Close as of {yesterday_str})"
+                final_stock_price_col = f"Stock Price ({yesterday_str}, Closing)"
                 if "Stock Price" in df.columns:
                     df = df.rename(columns={"Stock Price": final_stock_price_col})
                     
-                final_rate_col = f"Exchange Rate (to SGD) (Prev. Close as of {yesterday_str})"
+                final_rate_col = f"Exchange Rate (to SGD) ({yesterday_str}, Closing)"
                 if "Exchange Rate" in df.columns:
                     df = df.rename(columns={"Exchange Rate": final_rate_col})
 
@@ -200,65 +199,72 @@ if st.button("Start Analysis 🚀"):
                 df = df.loc[:, ~df.columns.duplicated()]
                 df = df.reindex(columns=target_order)
 
-                # Save to Buffer with Styling
-                buffer = io.BytesIO()
-                
-                with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                    df.to_excel(writer, index=False, sheet_name='Sheet1')
-                    
-                    workbook = writer.book
-                    worksheet = writer.sheets['Sheet1']
-                    
-                    header_fill = PatternFill(start_color="fefe99", end_color="fefe99", fill_type="solid")
-                    header_font = Font(bold=True)
-                    right_align = Alignment(horizontal='right')
-                    
-                    for cell in worksheet[1]:
-                        cell.fill = header_fill
-                        cell.font = header_font
-                        
-                        col_name = str(cell.value)
-                        col_idx = cell.column
-                        
-                        number_format = None
-                        apply_alignment = False
-                        
-                        if "('000)" in col_name:
-                            number_format = '#,##0;(#,##0)'
-                            apply_alignment = True
-                        elif "(%)" in col_name or "%" in col_name:
-                            number_format = '0.00%'
-                            apply_alignment = True
-                        elif col_name == "FY":
-                            apply_alignment = True
-                        elif "Stock Price" in col_name:
-                            number_format = '#,##0.000'
-                            apply_alignment = True
-                        elif "Exchange Rate" in col_name:
-                            number_format = '0.0000'
-                            apply_alignment = True
-                            
-                        if number_format or apply_alignment:
-                             for row in worksheet.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
-                                for cell_data in row:
-                                    if apply_alignment:
-                                        cell_data.alignment = right_align
-                                    if number_format:
-                                        cell_data.number_format = number_format
+                # --- EXCEL GENERATION (Memory Buffer Method) ---
+                # 1. First, save Pandas DataFrame to a temporary buffer
+                temp_buffer = io.BytesIO()
+                df.to_excel(temp_buffer, index=False)
+                temp_buffer.seek(0) # Rewind the buffer to the beginning
 
-                buffer.seek(0)
+                # 2. Load this buffer into openpyxl (just like opening a file)
+                wb = load_workbook(temp_buffer)
+                ws = wb.active
+
+                # 3. Apply Styles (Logic from main.py)
+                header_fill = PatternFill(start_color="fefe99", end_color="fefe99", fill_type="solid")
+                header_font = Font(bold=True)
+                right_align = Alignment(horizontal='right')
                 
-                # Download Button
+                for cell in ws[1]:
+                    # Apply Header Style
+                    cell.fill = header_fill
+                    cell.font = header_font
+                    
+                    col_name = str(cell.value)
+                    col_idx = cell.column
+                    
+                    number_format = None
+                    apply_alignment = False
+                    
+                    if "('000)" in col_name:
+                        number_format = '#,##0;(#,##0)'
+                        apply_alignment = True
+                    elif "(%)" in col_name or "%" in col_name:
+                        number_format = '0.00%'
+                        apply_alignment = True
+                    elif col_name == "FY":
+                        apply_alignment = True
+                    elif "Stock Price" in col_name:
+                        number_format = '#,##0.000'
+                        apply_alignment = True
+                    elif "Exchange Rate" in col_name:
+                        number_format = '0.0000'
+                        apply_alignment = True
+                        
+                    if number_format or apply_alignment:
+                         for row in ws.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
+                            for cell_data in row:
+                                if apply_alignment:
+                                    cell_data.alignment = right_align
+                                if number_format:
+                                    cell_data.number_format = number_format
+
+                # 4. Save the Styled Workbook to a Final Buffer
+                final_buffer = io.BytesIO()
+                wb.save(final_buffer)
+                final_buffer.seek(0) # Important: Rewind for download
+
+                # 5. Download Button
                 file_name = f"asean_financial_data_{datetime.today().strftime('%Y-%m-%d')}.xlsx"
                 
                 st.success("Analysis Complete! Download the Excel file below.")
                 st.download_button(
                     label="📥 Download Excel File",
-                    data=buffer,
+                    data=final_buffer,
                     file_name=file_name,
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
+                # Data Preview
                 st.subheader("Data Preview")
                 st.dataframe(df)
 
