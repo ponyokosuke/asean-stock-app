@@ -9,8 +9,50 @@ from openpyxl.styles import PatternFill, Font, Alignment
 # Import existing logic
 import data_processor
 
-# Page config
+# Page config (Must be the first Streamlit command)
 st.set_page_config(page_title="ASEAN Stock Analyzer", layout="wide")
+
+# --- 🔐 PASSWORD AUTHENTICATION START ---
+def check_password():
+    """Returns `True` if the user had the correct password."""
+
+    def password_entered():
+        """Checks whether a password entered by the user is correct."""
+        if st.session_state["password"] == st.secrets["APP_PASSWORD"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]  # don't store password
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # First run, show input for password.
+        st.text_input(
+            "Please enter the password to access this app:", 
+            type="password", 
+            on_change=password_entered, 
+            key="password"
+        )
+        return False
+    elif not st.session_state["password_correct"]:
+        # Password was incorrect, show input + error.
+        st.text_input(
+            "Please enter the password to access this app:", 
+            type="password", 
+            on_change=password_entered, 
+            key="password"
+        )
+        st.error("😕 Password incorrect")
+        return False
+    else:
+        # Password was correct.
+        return True
+
+if not check_password():
+    st.stop()  # Do not run the rest of the app if password is incorrect
+# --- 🔐 PASSWORD AUTHENTICATION END ---
+
+
+# === ⬇️ MAIN APP CONTENT STARTS HERE ⬇️ ===
 
 st.title("📊 ASEAN Stock Financial & AI Analysis Tool")
 st.markdown("Upload a stock list (CSV) to integrate Yahoo Finance data with Gemini AI analysis and export to Excel.")
@@ -20,13 +62,19 @@ with st.sidebar:
     st.header("Settings")
     
     # API Key Input
-    api_key = st.text_input("Gemini API Key", type="password", help="Leave blank if configured in Secrets")
-    
-    if api_key:
-        os.environ["GEMINI_API_KEY"] = api_key
-        # Re-initialize client
+    # Check if key is already in secrets (Environment Variable)
+    if "GEMINI_API_KEY" in st.secrets:
+        os.environ["GEMINI_API_KEY"] = st.secrets["GEMINI_API_KEY"]
         from google import genai
-        data_processor.client = genai.Client(api_key=api_key)
+        data_processor.client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        st.success("API Key loaded from Secrets ✅")
+    else:
+        # Fallback for manual input
+        api_key = st.text_input("Gemini API Key", type="password")
+        if api_key:
+            os.environ["GEMINI_API_KEY"] = api_key
+            from google import genai
+            data_processor.client = genai.Client(api_key=api_key)
 
 # --- File Uploader ---
 uploaded_file = st.file_uploader("Upload Stock List (CSV)", type=["csv"])
@@ -110,7 +158,6 @@ if st.button("Start Analysis 🚀"):
                 df["Listed 'o' / Non Listed \"x\""] = "o"
 
                 # Rename Date Columns
-                # Calculate YESTERDAY'S date for "Previous Close"
                 yesterday = datetime.now() - pd.Timedelta(days=1)
                 yesterday_str = yesterday.strftime("%b %d")
                 
@@ -156,25 +203,20 @@ if st.button("Start Analysis 🚀"):
                 # Save to Buffer with Styling
                 buffer = io.BytesIO()
                 
-                # Using openpyxl engine to access the workbook for styling
                 with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
                     df.to_excel(writer, index=False, sheet_name='Sheet1')
                     
-                    # Access the worksheet
                     workbook = writer.book
                     worksheet = writer.sheets['Sheet1']
                     
-                    # Define Styles
                     header_fill = PatternFill(start_color="fefe99", end_color="fefe99", fill_type="solid")
                     header_font = Font(bold=True)
                     right_align = Alignment(horizontal='right')
                     
-                    # Iterate through the header row (Row 1)
                     for cell in worksheet[1]:
                         cell.fill = header_fill
                         cell.font = header_font
                         
-                        # Apply Number Formats based on column name
                         col_name = str(cell.value)
                         col_idx = cell.column
                         
@@ -196,7 +238,6 @@ if st.button("Start Analysis 🚀"):
                             number_format = '0.0000'
                             apply_alignment = True
                             
-                        # Apply format to the data column below the header
                         if number_format or apply_alignment:
                              for row in worksheet.iter_rows(min_row=2, min_col=col_idx, max_col=col_idx):
                                 for cell_data in row:
@@ -218,7 +259,6 @@ if st.button("Start Analysis 🚀"):
                     mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                 )
                 
-                # Data Preview
                 st.subheader("Data Preview")
                 st.dataframe(df)
 
