@@ -199,23 +199,24 @@ if st.button("Start Analysis 🚀"):
                 df = df.loc[:, ~df.columns.duplicated()]
                 df = df.reindex(columns=target_order)
 
-                # --- EXCEL GENERATION (Memory Buffer Method) ---
-                # 1. First, save Pandas DataFrame to a temporary buffer
+                # --- ★ここが修正ポイント: 確実な保存方法 ---
+                
+                # 1. まずデータだけのExcelを一時メモリ(temp_buffer)に保存
                 temp_buffer = io.BytesIO()
                 df.to_excel(temp_buffer, index=False)
-                temp_buffer.seek(0) # Rewind the buffer to the beginning
+                temp_buffer.seek(0) # 巻き戻し
 
-                # 2. Load this buffer into openpyxl (just like opening a file)
+                # 2. openpyxlで読み込み
                 wb = load_workbook(temp_buffer)
                 ws = wb.active
 
-                # 3. Apply Styles (Logic from main.py)
+                # 3. スタイルを適用
                 header_fill = PatternFill(start_color="fefe99", end_color="fefe99", fill_type="solid")
                 header_font = Font(bold=True)
                 right_align = Alignment(horizontal='right')
                 
                 for cell in ws[1]:
-                    # Apply Header Style
+                    # ヘッダーの色設定
                     cell.fill = header_fill
                     cell.font = header_font
                     
@@ -248,12 +249,12 @@ if st.button("Start Analysis 🚀"):
                                 if number_format:
                                     cell_data.number_format = number_format
 
-                # 4. Save the Styled Workbook to a Final Buffer
+                # 4. 完成品を最終メモリ(final_buffer)に保存
                 final_buffer = io.BytesIO()
                 wb.save(final_buffer)
-                final_buffer.seek(0) # Important: Rewind for download
+                final_buffer.seek(0) # 巻き戻し（ダウンロードのために必須）
 
-                # 5. Download Button
+                # 5. ダウンロードボタン
                 file_name = f"asean_financial_data_{datetime.today().strftime('%Y-%m-%d')}.xlsx"
                 
                 st.success("Analysis Complete! Download the Excel file below.")
