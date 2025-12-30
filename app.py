@@ -1,181 +1,268 @@
-import streamlit as st
 import pandas as pd
+import yfinance as yf
+from datetime import datetime
 import time
-import io
+import json
 import os
-from datetime import datetime, timedelta
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill, Font, Alignment
+from google import genai
 from dotenv import load_dotenv
 
-# ローカル用（.envがあれば読み込むが、クラウドでは無視される）
 load_dotenv()
 
-# Import existing logic
-import data_processor
+# APIキーの取得（環境変数から）
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
-# Page config
-st.set_page_config(page_title="ASEAN Stock Analyzer", layout="wide")
+client = None
+if GEMINI_API_KEY:
+    try:
+        client = genai.Client(api_key=GEMINI_API_KEY)
+    except Exception as e:
+        print(f"⚠️ Gemini Client Initialization Error: {e}")
 
-# --- 🔑 SECRETS & ENV CONFIG ---
-# クラウド(Secrets機能)とローカル(.env)の両方から取得を試みる
-def get_secret(key):
-    if key in st.secrets:
-        return st.secrets[key]
-    return os.environ.get(key)
+# --- 1. AIによるセグメント分析 (encodingエラー対策済み) ---
+def batch_analyze_segments(all_results_list):
+    """
+    複数企業のビジネスサマリーをまとめてGeminiに送り、セグメント情報を抽出します。
+    """
+    if not client:
+        print("⚠️ Gemini client is not initialized. Skipping AI analysis.")
+        return all_results_list
 
-env_password = get_secret("APP_PASSWORD")
-env_gemini_key = get_secret("GEMINI_API_KEY")
-
-# --- 🔐 PASSWORD AUTHENTICATION ---
-def password_entered():
-    if st.session_state["password"] == env_password:
-        st.session_state["password_correct"] = True
-        del st.session_state["password"]
-    else:
-        st.session_state["password_correct"] = False
-
-def check_password():
-    if not env_password: # パスワード設定がない場合はスキップ（デバッグ用）
-        return True
-    if "password_correct" not in st.session_state:
-        st.text_input("Please enter the password:", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        st.text_input("Please enter the password:", type="password", on_change=password_entered, key="password")
-        st.error("😕 Password incorrect")
-        return False
-    return True
-
-if not check_password():
-    st.stop()
-
-# --- 💾 SESSION STATE ---
-if "excel_buffer" not in st.session_state:
-    st.session_state.excel_buffer = None
-if "final_df" not in st.session_state:
-    st.session_state.final_df = None
-
-# --- 🛠 HELPERS ---
-def robust_clean_columns(df):
-    """どんな時でも重複列を完全に消し去る"""
-    return df.loc[:, ~df.columns.duplicated()].copy()
-
-# --- MAIN APP ---
-st.title("📊 ASEAN Stock Financial & AI Analysis Tool")
-
-with st.sidebar:
-    st.header("Settings")
-    if env_gemini_key:
-        os.environ["GEMINI_API_KEY"] = env_gemini_key
-        from google import genai
-        data_processor.client = genai.Client(api_key=env_gemini_key)
-        st.success("API Key Loaded ✅")
-    else:
-        api_key = st.text_input("Gemini API Key (Required if not set in Secrets)", type="password")
-        if api_key:
-            from google import genai
-            data_processor.client = genai.Client(api_key=api_key)
-
-uploaded_file = st.file_uploader("Upload Stock List (CSV)", type=["csv"])
-use_sample = st.checkbox("Use default list (asean_list.csv) if no file is available")
-
-if st.button("Start Analysis 🚀"):
-    target_csv = uploaded_file if uploaded_file else ("asean_list.csv" if use_sample else None)
+    # ビジネスサマリーがあるものだけを対象にする
+    targets = [item for item in all_results_list if item.get('Summary of Business')]
     
-    if target_csv is None:
-        st.error("Please upload a CSV file.")
-    else:
+    if not targets:
+        return all_results_list
+
+    print(f"🤖 Gemini AI分析開始: 対象 {len(targets)} 件")
+    
+    batch_size = 20
+    model_name = 'gemini-2.0-flash' # 高速・高機能な最新モデルを使用
+    
+    for i in range(0, len(targets), batch_size):
+        batch = targets[i : i + batch_size]
+        
+        # プロンプトの構築
+        input_text = ""
+        for item in batch:
+            # 文字列を安全に処理（None対策と文字数制限）
+            summary = str(item.get('Summary of Business', ''))[:500].replace("\n", " ")
+            input_text += f"Code: {item['Code']}\nSummary: {summary}\n---\n"
+
+        prompt = f"""
+        You are a financial analyst. Based on the business summaries provided below, 
+        extract the main 'Business Segments' for EACH company.
+
+        # Output Rules
+        - Return ONLY a valid JSON object.
+        - Keys must be the 'Code'.
+        - Values must be a concise string of segments (comma separated).
+        - If unknown, provide a 3-4 word summary of their industry.
+
+        # Input Data
+        {input_text}
+        """
+
         try:
-            st.session_state.excel_buffer = None
-            df_input = pd.read_csv(target_csv, header=None)
-            codes = df_input[0].astype(str).tolist()
+            # AIリクエスト
+            response = client.models.generate_content(
+                model=model_name,
+                contents=prompt
+            )
             
-            status_text = st.empty()
-            progress_bar = st.progress(0)
+            response_text = response.text.strip()
             
-            all_results = []
-            for i, code in enumerate(codes):
-                code = code.strip()
-                status_text.text(f"Processing ({i+1}/{len(codes)}): {code}...")
-                progress_bar.progress((i + 1) / (len(codes) + 1))
-                raw_data = data_processor.get_stock_data(code)
-                if raw_data:
-                    all_results.append(data_processor.extract_data(code, raw_data))
-                time.sleep(0.1)
+            # JSON部分の抽出
+            if "```json" in response_text:
+                response_text = response_text.split("```json")[1].split("```")[0].strip()
+            elif "```" in response_text:
+                response_text = response_text.split("```")[1].split("```")[0].strip()
             
-            if all_results:
-                status_text.text("🤖 Running AI Analysis...")
-                all_results = data_processor.batch_analyze_segments(all_results)
-                
-                # データフレーム化
-                df = pd.DataFrame(all_results)
-                df = robust_clean_columns(df) # 重複排除
-                
-                # 整形
-                df = data_processor.format_for_excel(df)
-                df = robust_clean_columns(df) # 再度排除
-                
-                # 列の追加
-                df["Ref"] = range(1, len(df) + 1)
-                empty_cols = ["Taka's comments", "Remarks", "Visited (V) / Meeting Proposal (MP)", "Access", "Last Communications", "Category Classification/\nShareInvestor", "Incorporated\n (IN / Year)", "Category Classification/SGX", "Sector & Industry/ SGX"]
-                for col in empty_cols:
-                    if col not in df.columns:
-                        df[col] = ""
-                
-                df["Listed 'o' / Non Listed \"x\""] = "o"
+            segments_map = json.loads(response_text)
 
-                yesterday = datetime.now() - timedelta(days=1)
-                yesterday_str = yesterday.strftime("%b %d")
-                final_stock_price_col = f"Stock Price ({yesterday_str}, Closing)"
-                final_rate_col = f"Exchange Rate (to SGD) ({yesterday_str}, Closing)"
-                
-                # リネーム
-                df = df.rename(columns={"Stock Price": final_stock_price_col, "Exchange Rate": final_rate_col})
-                if "Number of Employee" in df.columns:
-                    df = df.rename(columns={"Number of Employee": "Number of Employee Current"})
-
-                # 並び替え（エラー対策の要）
-                target_order = ["Ref", "Name of Company", "Code", "Listed 'o' / Non Listed \"x\"", "Taka's comments", "Remarks", "Visited (V) / Meeting Proposal (MP)", "Website", "Major Shareholders", "Currency", final_rate_col, "FY", "REVENUE SGD('000)", "Segments", "PROFIT ('000)", "GROSS PROFIT ('000)", "OPERATING PROFIT ('000)", "NET PROFIT (Group) ('000)", "NET PROFIT (Shareholders) ('000)", "Minority Interest ('000)", "Shareholders' Equity ('000)", "Total Equity ('000)", "TOTAL ASSET ('000)", "Debt/Equity(%)", "Loan ('000)", "Loan/Equity (%)", final_stock_price_col, "Shares Outstanding ('000)", "Market Cap ('000)", "Summary of Business", "Chairman / CEO", "Address", "Contact No.", "Access", "Last Communications", "Number of Employee Current", "Category Classification/YahooFin", "Sector & Industry/YahooFin", "Category Classification/\nShareInvestor", "Incorporated\n (IN / Year)", "Category Classification/SGX", "Sector & Industry/ SGX"]
-                
-                # 重複を最終排除した上で、足りない列を埋める
-                df = robust_clean_columns(df)
-                for col in target_order:
-                    if col not in df.columns:
-                        df[col] = ""
-                
-                # 並び替え実行
-                df = df.reindex(columns=target_order)
-
-                # Excel作成
-                temp_buffer = io.BytesIO()
-                df.to_excel(temp_buffer, index=False)
-                temp_buffer.seek(0)
-                wb = load_workbook(temp_buffer)
-                for cell in wb.active[1]:
-                    cell.fill = PatternFill(start_color="fefe99", end_color="fefe99", fill_type="solid")
-                    cell.font = Font(bold=True)
-                
-                final_buffer = io.BytesIO()
-                wb.save(final_buffer)
-                
-                st.session_state.excel_buffer = final_buffer.getvalue()
-                st.session_state.final_df = df
-                st.session_state.output_filename = f"asean_financial_data_{datetime.today().strftime('%Y-%m-%d')}.xlsx"
-                
-                progress_bar.progress(100)
-                status_text.text("✅ Analysis completed!")
+            # 結果を元のリストに反映
+            for item in batch:
+                code = item['Code']
+                if code in segments_map:
+                    item['Segments'] = segments_map[code]
+            
+            time.sleep(1) # レートリミット回避
 
         except Exception as e:
-            st.error(f"Error: {e}")
+            # ログ出力時のエンコードエラーを防ぐため、エラーメッセージを安全に表示
+            err_msg = str(e).encode('ascii', 'ignore').decode('ascii')
+            print(f"⚠️ Batch AI Error: {err_msg}")
+            continue
 
-# --- 📥 DOWNLOAD AREA ---
-if st.session_state.excel_buffer:
-    st.divider()
-    st.download_button(
-        label="📥 Download Excel File",
-        data=st.session_state.excel_buffer,
-        file_name=st.session_state.output_filename,
-        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-    )
-    st.dataframe(st.session_state.final_df)
+    return all_results_list
+
+
+# --- 2. データ取得関数 (404エラー対策済み) ---
+def get_stock_data(code):
+    """
+    Yahoo Financeから個別の銘柄データを取得します。
+    """
+    try:
+        ticker = yf.Ticker(code)
+        # 取得を試みる（存在しない場合はここでエラーまたは空が返る）
+        info = ticker.info
+        
+        if not info or 'symbol' not in info:
+            print(f"Skipped {code}: No data found")
+            return None
+
+        return {
+            "info": info,
+            "balance_sheet": ticker.balance_sheet,
+            "financials": ticker.financials,
+            "major_holders": ticker.major_holders,
+            "institutional_holders": ticker.institutional_holders
+        }
+    except Exception as e:
+        # ログを簡潔に（404エラーなど）
+        print(f"Skipped {code}: {str(e)[:50]}")
+        return None
+
+def get_exchange_rate(from_currency):
+    """
+    指定通貨からSGDへの為替レートを取得。
+    """
+    if not from_currency or from_currency == "SGD":
+        return 1.0
+    
+    currency_code = "CNY" if from_currency == "RMB (CNY)" else from_currency
+    pair = f"{currency_code}SGD=X"
+    
+    try:
+        ticker = yf.Ticker(pair)
+        rate = ticker.info.get('previousClose')
+        if rate is None:
+            hist = ticker.history(period="5d")
+            rate = hist['Close'].iloc[-1] if not hist.empty else "N/A"
+        return rate
+    except:
+        return "N/A"
+
+
+# --- 3. データの抽出・整形ロジック ---
+def format_shareholders(holders_data, data_type="major"):
+    if holders_data is None or holders_data.empty:
+        return None
+    
+    lines = []
+    try:
+        # 基本的に上位5件程度を抽出して文字列にする
+        for index, row in holders_data.head(5).iterrows():
+            if len(row) >= 2:
+                lines.append(f"{row.iloc[1]}: {row.iloc[0]}")
+            else:
+                lines.append(f"{index}: {row.iloc[0]}")
+    except:
+        return "Error parsing"
+    
+    return "\n".join(lines) if lines else "Not Available"
+
+
+def extract_data(code, raw_data):
+    info = raw_data.get("info", {})
+    bs = raw_data.get("balance_sheet")
+    inc = raw_data.get("financials")
+    
+    # 決算期日の特定
+    latest_date = bs.columns[0] if bs is not None and not bs.empty else None
+
+    def get_val(df, key):
+        if df is not None and not df.empty and key in df.index and latest_date in df.columns:
+            val = df.loc[key, latest_date]
+            return val if pd.notnull(val) else 0
+        return 0
+
+    # 会計数値の抽出
+    revenue = get_val(inc, "Total Revenue")
+    operating_income = get_val(inc, "Operating Income")
+    net_profit_owners = get_val(inc, "Net Income")
+    
+    total_assets = get_val(bs, "Total Assets")
+    total_equity = get_val(bs, "Total Equity Gross Minority Interest")
+    if total_equity == 0:
+        total_equity = get_val(bs, "Stockholders Equity")
+
+    loan = get_val(bs, "Total Debt")
+    
+    # 指標計算
+    debt_ratio = (total_assets - total_equity) / total_equity if total_equity != 0 else 0
+    loan_ratio = loan / total_equity if total_equity != 0 else 0
+
+    # 基本情報
+    raw_currency = info.get('financialCurrency', info.get('currency', 'SGD'))
+    display_currency = 'RMB (CNY)' if raw_currency == 'CNY' else raw_currency
+    
+    # マレーシア市場の細分類
+    market = info.get('exchange', 'Unknown')
+    if str(code).endswith('.KL'):
+        clean_code = str(code).replace('.KL', '')
+        if clean_code.startswith('03'): market = "LEAP"
+        elif clean_code.startswith('0'): market = "ACE"
+        else: market = "Main"
+
+    return {
+        "Name of Company": info.get('longName'),
+        "Code": code,
+        "Currency": display_currency,
+        "Exchange Rate": get_exchange_rate(display_currency),
+        "Website": info.get('website'),
+        "Major Shareholders": format_shareholders(raw_data.get("major_holders")),
+        "FY": datetime.fromtimestamp(info['lastFiscalYearEnd']) if info.get('lastFiscalYearEnd') else None,
+        "REVENUE": revenue,
+        "Segments": "",
+        "PROFIT": get_val(inc, "Pretax Income") or operating_income,
+        "GROSS PROFIT": get_val(inc, "Gross Profit"),
+        "OPERATING PROFIT": operating_income,
+        "NET PROFIT (Group)": get_val(inc, "Net Income Including Noncontrolling Interests") or net_profit_owners,
+        "NET PROFIT (Shareholders)": net_profit_owners,
+        "Minority Interest": get_val(bs, "Minority Interest"),
+        "Shareholders' Equity": get_val(bs, "Stockholders Equity"),
+        "Total Equity": total_equity,
+        "TOTAL ASSET": total_assets,
+        "Debt/Equity(%)": debt_ratio,
+        "Loan": loan,
+        "Loan/Equity (%)": loan_ratio,
+        "Stock Price": info.get('previousClose') or info.get('regularMarketPrice'),
+        "Shares Outstanding": info.get('sharesOutstanding'),
+        "Market Cap": info.get('marketCap'),
+        "Summary of Business": info.get('longBusinessSummary', ''),
+        "Chairman / CEO": info.get('companyOfficers', [{}])[0].get('name', 'N/A'),
+        "Address": f"{info.get('address1', '')}, {info.get('city', '')}, {info.get('country', '')}",
+        "Contact No.": info.get('phone'),
+        "Number of Employee": info.get('fullTimeEmployees'),
+        "Category Classification/YahooFin": info.get('sector', 'N/A'),
+        "Sector & Industry/YahooFin": info.get('industry', 'N/A'),
+        "Market": market
+    }
+
+# --- 4. Excel出力用数値整形 ---
+def format_for_excel(df):
+    """
+    数値を1000単位にし、日付を見やすく整形します。
+    """
+    money_cols = [
+        'REVENUE', 'PROFIT', 'GROSS PROFIT', 'OPERATING PROFIT', 
+        'NET PROFIT (Group)', 'NET PROFIT (Shareholders)', 'Minority Interest',
+        "Shareholders' Equity", 'Total Equity', 'TOTAL ASSET', 'Loan',
+        'Market Cap', 'Shares Outstanding'
+    ]
+    
+    for col in money_cols:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce') / 1000.0
+
+    # カラム名に ('000) を付与
+    df = df.rename(columns={c: f"{c} ('000)" for c in money_cols})
+    if "REVENUE ('000)" in df.columns:
+        df = df.rename(columns={"REVENUE ('000)": "REVENUE SGD('000)"})
+
+    # 日付整形
+    if 'FY' in df.columns:
+        df['FY'] = pd.to_datetime(df['FY'], errors='coerce').dt.strftime('%b %Y').fillna('')
+
+    return df
